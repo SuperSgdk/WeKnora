@@ -1,15 +1,19 @@
 name: PR 3924 Linux validation
 
 on:
-  push:
-    branches: [ci/pr3924-linux-checks]
   workflow_dispatch:
+    inputs:
+      scope:
+        description: Validation jobs to run
+        type: choice
+        options: [all, docreader, go]
+        default: all
 
 permissions:
   contents: read
 
 concurrency:
-  group: pr3924-linux-${{ github.ref }}
+  group: pr3924-linux-${{ github.ref }}-${{ inputs.scope }}
   cancel-in-progress: true
 
 env:
@@ -18,6 +22,7 @@ env:
 
 jobs:
   docreader:
+    if: inputs.scope != 'go'
     name: DocReader Python and RPC tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -107,6 +112,7 @@ jobs:
           path: validation-logs
 
   go:
+    if: inputs.scope != 'docreader'
     name: Go clients and full repository checks
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -143,9 +149,9 @@ jobs:
       - name: Run live Go client tests without skips
         run: |
           go test ./docreader/client ./docreader/proto -count=1 -v 2>&1 | tee validation-logs/go-clients.log
-          if rg -- '--- SKIP:' validation-logs/go-clients.log; then exit 1; fi
-          rg -- '--- PASS: TestReadURL' validation-logs/go-clients.log
-          rg -- '--- PASS: TestReadFile' validation-logs/go-clients.log
+          if grep -F -- '--- SKIP:' validation-logs/go-clients.log; then exit 1; fi
+          grep -F -- '--- PASS: TestReadURL' validation-logs/go-clients.log
+          grep -F -- '--- PASS: TestReadFile' validation-logs/go-clients.log
       - name: Check diff and repository formatting
         run: |
           git diff --check "$BASE_COMMIT...HEAD"
