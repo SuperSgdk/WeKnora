@@ -1,0 +1,179 @@
+name: PR 3924 Linux validation
+
+on:
+  push:
+    branches: [ci/pr3924-linux-checks]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr3924-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PR_COMMIT: 4d662b9c28e82d0f71a0f75e1405b82b3be22898
+  BASE_COMMIT: bccb4b151bae403508da77fbb174efc79dc47c1a
+
+jobs:
+  docreader:
+    name: DocReader Python and RPC tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.PR_COMMIT }}
+          fetch-depth: 2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10.18'
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: docreader/uv.lock
+      - name: Install locked dependencies and Linux system tools
+        run: |
+          mkdir -p validation-logs
+          uv sync --project docreader --locked --no-dev --python 3.10.18
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-calc
+          docreader/.venv/bin/python -m playwright install --with-deps webkit
+      - name: Compile Python sources
+        run: docreader/.venv/bin/python -m compileall -q docreader
+      - name: Run complete Python suite
+        run: docreader/.venv/bin/python -m unittest discover -s docreader/tests -p 'test_*.py' -v 2>&1 | tee validation-logs/python-tests.log
+      - name: Verify expected regression failures on unchanged baseline
+        run: |
+          docreader/.venv/bin/python - <<'PY' 2>&1 | tee validation-logs/epub-baseline.log
+          import os, subprocess, types, unittest
+          import docreader.tests.test_epub_parser as tests
+          source = subprocess.check_output(['git', 'show', os.environ['BASE_COMMIT'] + ':docreader/parser/epub_parser.py'], text=True)
+          module = types.ModuleType('docreader.parser.epub_parser_baseline')
+          exec(compile(source, 'epub_parser_baseline.py', 'exec'), module.__dict__)
+          tests.EPUBParser = module.EPUBParser
+          result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(tests.EPUBParserTest))
+          assert result.testsRun == 7 and len(result.failures) == 6 and not result.errors, 'Unexpected baseline regression result'
+          print('Expected baseline: 6 regression failures; four original tests pass')
+          PY
+      - name: Verify production unary, streaming, and ZIP fallback image bytes
+        run: |
+          docreader/.venv/bin/python - <<'PY' 2>&1 | tee validation-logs/epub-rpc.log
+          from concurrent import futures
+          import re
+          from unittest.mock import patch
+          import grpc
+          from docreader.main import DocReaderServicer
+          from docreader.proto import docreader_pb2 as pb, docreader_pb2_grpc as rpc
+          from docreader.tests.test_epub_parser import _epub_with_colliding_image_names
+          content, expected = _epub_with_colliding_image_names('pic.png')
+          request = pb.ReadRequest(file_content=content, file_name='colliding.epub', file_type='epub', config=pb.ReadConfig(parser_engine='builtin'))
+          def check(markdown, images):
+              refs = dict(re.findall(r'!\[(first|second|root)\]\((images/[^)]+)\)', markdown))
+              actual = {image.original_ref: image.image_data for image in images}
+              assert len(actual) == 3
+              for chapter, data in expected.items():
+                  assert actual[refs[chapter]] == data, chapter
+          server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+          rpc.add_DocReaderServicer_to_server(DocReaderServicer(), server)
+          port = server.add_insecure_port('127.0.0.1:0')
+          server.start()
+          try:
+              with grpc.insecure_channel(f'127.0.0.1:{port}') as channel:
+                  grpc.channel_ready_future(channel).result(timeout=10)
+                  stub = rpc.DocReaderStub(channel)
+                  response = stub.Read(request, timeout=15)
+                  assert not response.error, response.error
+                  check(response.markdown_content, response.image_refs)
+                  print('Unary Read: all chapter/image bytes correct')
+                  frames = list(stub.ReadStream(request, timeout=15))
+                  assert len(frames) == 4 and frames[0].HasField('meta') and not frames[0].meta.error
+                  assert frames[0].meta.image_count == 3 and all(frame.HasField('image') for frame in frames[1:])
+                  check(frames[0].meta.markdown_content, [frame.image for frame in frames[1:]])
+                  print('ReadStream: metadata and all three image frames correct')
+                  with patch('ebooklib.epub.read_epub', side_effect=ValueError('exercise ZIP fallback')):
+                      response = stub.Read(request, timeout=15)
+                      assert not response.error, response.error
+                      check(response.markdown_content, response.image_refs)
+                  print('ZIP fallback Read: all chapter/image bytes correct')
+          finally:
+              server.stop(0).wait(timeout=10)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: docreader-validation-logs
+          path: validation-logs
+
+  go:
+    name: Go clients and full repository checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.PR_COMMIT }}
+          fetch-depth: 2
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.0'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: docreader/uv.lock
+      - name: Prepare separate Python environments and live DocReader
+        run: |
+          mkdir -p validation-logs
+          python -m venv "$RUNNER_TEMP/go-test-python"
+          echo "$RUNNER_TEMP/go-test-python/bin" >> "$GITHUB_PATH"
+          uv python install 3.10.18
+          uv sync --project docreader --locked --no-dev --python 3.10.18
+          docreader/.venv/bin/python -m playwright install --with-deps webkit
+          docreader/.venv/bin/python -m docreader.main > validation-logs/server.log 2>&1 &
+          echo $! > "$RUNNER_TEMP/docreader-pr3924.pid"
+          docreader/.venv/bin/python - <<'PY'
+          import grpc
+          with grpc.insecure_channel('127.0.0.1:50051') as channel:
+              grpc.channel_ready_future(channel).result(timeout=30)
+          PY
+      - name: Run live Go client tests without skips
+        run: |
+          go test ./docreader/client ./docreader/proto -count=1 -v 2>&1 | tee validation-logs/go-clients.log
+          if rg -- '--- SKIP:' validation-logs/go-clients.log; then exit 1; fi
+          rg -- '--- PASS: TestReadURL' validation-logs/go-clients.log
+          rg -- '--- PASS: TestReadFile' validation-logs/go-clients.log
+      - name: Check diff and repository formatting
+        run: |
+          git diff --check "$BASE_COMMIT...HEAD"
+          make fmt 2>&1 | tee validation-logs/fmt.log
+          git diff --exit-code -- '*.go'
+      - name: Install repository lint version
+        run: |
+          curl -fsSL https://github.com/golangci/golangci-lint/releases/download/v2.12.2/golangci-lint-2.12.2-linux-amd64.tar.gz -o "$RUNNER_TEMP/golangci-lint.tar.gz"
+          echo "8df580d2670fed8fa984aac0507099af8df275e665215f5c7a2ae3943893a553  $RUNNER_TEMP/golangci-lint.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/golangci-lint.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/golangci-lint-2.12.2-linux-amd64" >> "$GITHUB_PATH"
+      - name: Full lint - record pre-existing Go findings
+        id: lint
+        continue-on-error: true
+        run: make lint 2>&1 | tee validation-logs/lint.log
+      - name: Run full repository Go tests
+        run: make test 2>&1 | tee validation-logs/go-full-tests.log
+      - name: Record validation scope
+        if: always()
+        run: |
+          echo "Code tested: $PR_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+          echo "Full lint step outcome: ${{ steps.lint.outcome }}. This Python-only PR does not change Go source; inspect lint.log for baseline findings." >> "$GITHUB_STEP_SUMMARY"
+      - name: Stop temporary DocReader
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/docreader-pr3924.pid" ]; then kill "$(cat "$RUNNER_TEMP/docreader-pr3924.pid")" 2>/dev/null || true; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-validation-logs
+          path: validation-logs
