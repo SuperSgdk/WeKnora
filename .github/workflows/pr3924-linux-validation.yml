@@ -6,7 +6,7 @@ on:
       scope:
         description: Validation jobs to run
         type: choice
-        options: [all, docreader, go]
+        options: [all, docreader, go, baseline]
         default: all
 
 permissions:
@@ -43,15 +43,22 @@ jobs:
           enable-cache: true
           cache-dependency-glob: docreader/uv.lock
       - name: Install locked dependencies and Linux system tools
+        if: inputs.scope != 'baseline'
         run: |
           mkdir -p validation-logs
           uv sync --project docreader --locked --no-dev --python 3.10.18
           sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3 update
           sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3 install -y --no-install-recommends libreoffice-calc
           docreader/.venv/bin/python -m playwright install --with-deps webkit
+      - name: Install locked dependencies for isolated baseline replay
+        if: inputs.scope == 'baseline'
+        run: |
+          mkdir -p validation-logs
+          uv sync --project docreader --locked --no-dev --python 3.10.18
       - name: Compile Python sources
         run: docreader/.venv/bin/python -m compileall -q docreader
       - name: Run complete Python suite
+        if: inputs.scope != 'baseline'
         run: docreader/.venv/bin/python -m unittest discover -s docreader/tests -p 'test_*.py' -v 2>&1 | tee validation-logs/python-tests.log
       - name: Verify expected regression failures on unchanged baseline
         run: |
@@ -62,11 +69,13 @@ jobs:
           module = types.ModuleType('docreader.parser.epub_parser_baseline')
           exec(compile(source, 'epub_parser_baseline.py', 'exec'), module.__dict__)
           tests.EPUBParser = module.EPUBParser
+          tests.registry._engines['builtin']['epub'] = module.EPUBParser
           result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(tests.EPUBParserTest))
           assert result.testsRun == 7 and len(result.failures) == 6 and not result.errors, 'Unexpected baseline regression result'
           print('Expected baseline: 6 regression failures; four original tests pass')
           PY
       - name: Verify production unary, streaming, and ZIP fallback image bytes
+        if: inputs.scope != 'baseline'
         run: |
           docreader/.venv/bin/python - <<'PY' 2>&1 | tee validation-logs/epub-rpc.log
           from concurrent import futures
@@ -116,7 +125,7 @@ jobs:
           path: validation-logs
 
   go:
-    if: inputs.scope != 'docreader'
+    if: inputs.scope != 'docreader' && inputs.scope != 'baseline'
     name: Go clients and full repository checks
     runs-on: ubuntu-latest
     timeout-minutes: 40
