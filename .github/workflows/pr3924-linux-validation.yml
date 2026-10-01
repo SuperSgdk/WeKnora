@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: pr3924-linux-${{ github.ref }}-${{ inputs.scope }}
   cancel-in-progress: true
